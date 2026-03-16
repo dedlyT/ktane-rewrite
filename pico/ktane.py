@@ -1,6 +1,8 @@
-import components
+from components import IO
 import uasyncio
 import time
+
+async def __empty(*a, **kw): pass
 
 async def __empty(*a, **kw): pass
 
@@ -11,15 +13,16 @@ class Module:
         "on_minute_passed",
         "on_hour_passed"
     )
-    ALLOWED_COMPONENTS = (components.IO,)
+    ALLOWED_COMPONENTS = (IO,)
 
-    def __init__(self, name):
+    def __init__(self, name, status_led):
         self.g = {}
         self.__name = name
         self.__event_hooks = dict.fromkeys(self.ALLOWED_EVENTS, __empty)
         self.__event_queue = []
         self.__tasks = []
         self.__time_timer = 0
+        self.__status_led = tuple(IO(pin) for pin in status_led)
         self.__time = {u:0 for u in "smh"}
         self.__components = []
     
@@ -40,6 +43,10 @@ class Module:
         if type(obj) not in self.ALLOWED_COMPONENTS:
             raise ValueError(f"obj must be an allowed type, not {type(obj)}")
         self.__components.append({"obj":obj, "last":False})
+
+    def set_status_led(self, values):
+        for led,v in zip(self.__status_led, values):
+            led.value(v)
 
     async def __event_handler(self):
         while True:
