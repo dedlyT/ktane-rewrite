@@ -1,4 +1,3 @@
-import machine as m
 import components
 import uasyncio
 import time

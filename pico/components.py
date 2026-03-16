@@ -7,7 +7,8 @@ class IO:
     LISTENERS = ("high", "while_high", "low", "while_low")
     
     def __init__(self, pin, *args, **kwargs):
-        self._mode = kwargs.get("mode", m.Pin.OUT)
+        if len(args) == 0: args = ["out"]
+        self._mode = args[0]
 
         if self._mode == "pwm":
             freq = kwargs.get("freq", 50)
@@ -32,7 +33,6 @@ class IO:
         
         self.__listeners = dict.fromkeys(self.LISTENERS, __empty)
 
-
         if self._mode in ("in", 0, m.Pin.IN):
             self._mode = m.Pin.IN
 
@@ -40,15 +40,15 @@ class IO:
             if pull is None: raise ValueError("pull must be defined!")
             if pull in ("up", 1, m.Pin.PULL_UP): self._pull = m.Pin.PULL_UP
             if pull in ("down", 0, m.Pin.PULL_DOWN): self._pull = m.Pin.PULL_DOWN
-            if pull not in (m.Pin.PULL_UP, m.Pin.PULL_DOWN): raise ValueError(f"pull must be either 'up' or 'down', not {pull}")
+            if self._pull not in (m.Pin.PULL_UP, m.Pin.PULL_DOWN): raise ValueError(f"pull must be either 'up' or 'down', not {pull}")
 
-            self.__obj = m.Pin(pin, mode=self._mode, pull=self._pud)
+            self.__obj = m.Pin(pin, mode=self._mode, pull=self._pull)
         
         if self._mode in ("out", 1, m.Pin.OUT):
             self._mode = m.Pin.OUT
             self.__obj = m.Pin(pin, mode=self._mode)
 
-        if self._mode not in (m.Pin.IN, m.Pin.OUT): raise ValueError(f"mode must be either 'in' or 'out', not {self._mode}")
+        if self._mode not in (m.Pin.IN, m.Pin.OUT): raise ValueError(f"mode must be either 'in', 'out' or 'pwm', not {self._mode}")
     
     #DECORATOR
     def listener(self, event):
@@ -93,7 +93,6 @@ class IO:
                 raise ValueError(f"v must be between {self.MAX_U16} and 0")
             self.__obj.duty_u16(v)
             return
-
 
         if v is None:
             return self.__obj.value()
