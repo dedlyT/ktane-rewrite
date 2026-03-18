@@ -4,8 +4,6 @@ import time
 
 async def __empty(*a, **kw): pass
 
-async def __empty(*a, **kw): pass
-
 class Module:
     ALLOWED_EVENTS = (
         "on_ready",

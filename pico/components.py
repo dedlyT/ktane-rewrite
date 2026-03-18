@@ -27,7 +27,9 @@ class IO:
                     raise ValueError("duty_cycle must be between 1 and 0")
                 duty_u16 = int(round(duty_cycle * self.MAX_U16))
             
-            self.__obj = m.PWM(pin, freq=freq, duty_u16=duty_u16)
+            self.__obj = m.PWM(m.Pin(pin))
+            self.__obj.freq(freq)
+            self.__obj.duty_u16(duty_u16)
             self.value(0, percentage=True)
             return
         
@@ -72,6 +74,11 @@ class IO:
         if self._mode == m.Pin.IN:
             raise RuntimeError(f"Cannot switch IO configured as 'in'!")
         self.value(not self.value())
+    
+    def freq(self, v):
+        if self._mode != "pwm":
+            raise RuntimeError(f"Cannot change frequency of IO configured as '{self._mode}'")
+        self.__obj.freq(v)
 
     def value(self, v=None, **kwargs):
         if self._mode == "pwm":
