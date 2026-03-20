@@ -6,13 +6,23 @@ import time
 
 START_BYTE = 0xAA
 RX_GLOBAL_BYTE = 0xEE
-CMD = 2
-RX = 3
-TX = 4
-LEN = 5
+CMD, RX, TX, LEN = 2,3,4,5
 CHKSUM = lambda cmd,rx,tx,len,data: (cmd+rx+tx+len+sum(data)) & 0xFF
 
+REG_ATTEMPT, REG_FAIL, REG_SUCCESS = 0xBA, 0xBF, 0xBB
+REG_TIMEOUT = 2000
+REG_QUERY = 0xBC
+
+HEARTBEAT = 0xBD
+HEARTBEAT_TIMEOUT = 3000
+
 async def __empty(*a, **kw): pass
+
+def generate_tempid():
+    temp_id = None
+    while temp_id in (None, START_BYTE, RX_GLOBAL_BYTE):
+        temp_id = random.randint(1,255)
+    return temp_id
 
 class Module:
     ALLOWED_EVENTS = (
@@ -24,13 +34,14 @@ class Module:
     )
     ALLOWED_COMPONENTS = (IO,)
 
-    def __init__(self, **kwargs):
+    def __init__(self, name, **kwargs):
+        self.__name = name
         self.g = {}
+        self.g["modules"] = {}
+        self.g["module_addresses"] = {}
+        self.__alive_modules = []
+        self.__last_pruned_modules = 0
 
-        self.__id = None
-        while self.__id in (None, START_BYTE, RX_GLOBAL_BYTE):
-            self.__id = random.randint(0,255)
-        
         self.__event_hooks = dict.fromkeys(self.ALLOWED_EVENTS, __empty)
         self.__event_queue = []
         self.__command_hooks = {}
@@ -49,7 +60,7 @@ class Module:
             raise ValueError("Module missing uart keyword argument")
         if not isinstance(uart, (list,tuple)) or not all(isinstance(x, int) for x in status_led):
             raise ValueError("uart must be a tuple of ints!")
-        self.__uart = m.UART(0, baudrate=9000, tx=m.Pin(uart[0]), rx=m.Pin(uart[1]))
+        self.__uart_obj = m.UART(0, baudrate=9000, tx=m.Pin(uart[0]), rx=m.Pin(uart[1]))
         self.__uart_data = {"DATA":[], "CMD":None, "LEN":None, "RX":None, "TX":None, "POS":0}
 
         self.__time = {u:0 for u in "smh"}
@@ -108,7 +119,8 @@ class Module:
             raise ValueError(f"rx must not be reserved hexadecimal byte {START_BYTE}")
         packet.append(rx) #[RX]
         
-        packet.append(self.__id) #[TX]
+        tx = kwargs.get("tx", self.__id)
+        packet.append(tx) #[TX]
 
         if data is None:
             data = []
@@ -136,16 +148,101 @@ class Module:
         if final_data != []:
             packet.extend(final_data) #[DATA]
 
-        checksum = CHKSUM(cmd, rx, self.__id, len(final_data), final_data)
+        checksum = CHKSUM(cmd, rx, tx, len(final_data), final_data)
         packet.append(checksum) #[CHK]
 
-        self.__uart.write(packet)
+        self.__uart_obj.write(packet)
+
+    async def __process_command(self, data):
+        if data["TX"] in (self.__id, self.__temp_id):
+            if data["CMD"] == REG_ATTEMPT and self.__id is None:
+                self.__id = self.__temp_id
+                self.__temp_id = None
+                self.send(REG_SUCCESS, self.__name)
+                self.send(REG_QUERY)
+                self.__event_queue.append(self.__event_hooks["on_ready"])
+            return
+        
+        if data["RX"] not in (RX_GLOBAL_BYTE, self.__id, self.__temp_id):
+            self.send(data["CMD"], data["DATA"], tx=data["TX"], rx=data["RX"])
+            return
+        
+        if data["CMD"] == REG_FAIL:
+            self.__temp_id = generate_tempid()
+            self.send(REG_ATTEMPT, tx=self.__temp_id)
+            return
+        if data["CMD"] == REG_ATTEMPT:
+            if data["TX"] in (self.__id, self.__temp_id):
+                self.send(REG_FAIL, rx=data["TX"], tx=(self.__id or self.__temp_id))
+                return
+            self.send(REG_ATTEMPT, tx=data["TX"])
+            return
+        if data["CMD"] == REG_SUCCESS:
+            id = data["TX"]
+            name = "".join(list(map(chr, data["DATA"])))
+            self.g["modules"][id] = { "name":name }
+            self.g["module_addresses"][name] = self.g["module_addresses"].get(name, []) + [id]
+            self.send(REG_SUCCESS, data=data["DATA"], tx=data["TX"])
+            return
+        if data["CMD"] == REG_QUERY:
+            rx = data["TX"]
+            if self.__id is not None:
+                self.send(REG_SUCCESS, self.__name, rx=rx)
+            self.send(REG_QUERY, tx=rx)
+            return
+        if data["CMD"] == HEARTBEAT:
+            if data["TX"] not in self.__alive_modules:
+                self.__alive_modules.append(data["TX"])
+            self.send(HEARTBEAT, tx=data["TX"])
+            return
+
+        cmd = data["CMD"]
+        tx = data["TX"]
+        data_data = data["DATA"]
+        self.__event_queue.append(lambda cmd=cmd, tx=tx, data=data_data: self.__command_hooks.get(cmd, __empty)(tx, data))
+        self.__event_queue.append(lambda cmd=cmd, tx=tx, data=data_data: self.__event_hooks["on_command_received"](tx, cmd, data))
+
+    async def __module_registrator(self):
+        self.__id = None
+        self.__temp_id = generate_tempid() if "timer" != self.__name else 0x00
+        
+        #while unregistered:
+        while self.__id is None:
+            await uasyncio.sleep_ms(REG_TIMEOUT)
+            if self.__id is not None:
+                break
+            self.send(REG_ATTEMPT, tx=self.__temp_id)
+        
+        #heartbeat while registered:
+        while True:
+            await uasyncio.sleep_ms((HEARTBEAT_TIMEOUT//2) + random.randint(0,(HEARTBEAT_TIMEOUT//6)))
+            self.send(HEARTBEAT)
+
+            if time.ticks_diff(time.ticks_ms(), self.__last_pruned_modules) >= HEARTBEAT_TIMEOUT:
+                self.__last_pruned_modules = time.ticks_ms()
+
+                for module_name in list(self.g["module_addresses"].keys()):
+                    module_addresses = self.g["module_addresses"][module_name]
+                    
+                    filtered_list = []
+                    for module_id in module_addresses:
+                        if module_id in self.__alive_modules:
+                            filtered_list.append(module_id)
+                            continue
+                        self.g["modules"][module_id].pop(module_id, None)
+                    
+                    if filtered_list:
+                        self.g["module_addresses"][module_name] = filtered_list
+                        continue
+                    del self.g["module_addresses"][module_name]
+                
+                self.__alive_modules.clear()
 
     async def __uart_listener(self):
         while True:
             await uasyncio.sleep_ms(1)
-            if not self.__uart.any(): continue
-            byte = self.__uart.read(1)[0]
+            if not self.__uart_obj.any(): continue
+            byte = self.__uart_obj.read(1)[0]
 
             if not self.__uart_data["POS"]:
                 if byte == START_BYTE:
@@ -169,23 +266,18 @@ class Module:
                 if self.__uart_data["POS"] > (LEN + self.__uart_data["LEN"]):
                     checksum = CHKSUM(self.__uart_data["CMD"], self.__uart_data["RX"], self.__uart_data["TX"], self.__uart_data["LEN"], self.__uart_data["DATA"])
                     if byte != checksum:
-                        print(f"DISCARD! {byte=} {checksum=} {self.__uart_data=}")
                         self.__uart_data = {"DATA":[], "CMD":None, "LEN":None, "RX":None, "TX":None, "POS":0}
                         continue
 
-                    cmd = self.__uart_data["CMD"]
-                    tx = self.__uart_data["TX"]
-                    data = self.__uart_data["DATA"].copy()
-                    self.__event_queue.append(lambda cmd=cmd, tx=tx, data=data: self.__command_hooks.get(cmd, __empty)(tx, data))
-                    self.__event_queue.append(lambda cmd=cmd, tx=tx, data=data: self.__event_hooks["on_command_received"](tx, cmd, data))
-
+                    await self.__process_command(self.__uart_data.copy())
                     self.__uart_data = {"DATA":[], "CMD":None, "LEN":None, "RX":None, "TX":None, "POS":0}
                     continue
                 self.__uart_data["DATA"].append(byte)
-
+    
     async def __event_handler(self):
         while True:
             await uasyncio.sleep_ms(1)
+            if self.__id is None: continue
             if not len(self.__event_queue): continue
             
             event = self.__event_queue.pop(0)
@@ -222,7 +314,6 @@ class Module:
             self.__components = [component_data] + self.__components
 
     async def __event_listener(self):
-        self.__event_queue.append(self.__event_hooks["on_ready"])
         while True:
             await uasyncio.sleep_ms(1)
             current_ticks = time.ticks_ms()
@@ -243,6 +334,7 @@ class Module:
                 if h != old_time["h"]: self.__event_queue.append(lambda time=self.__time: self.__event_hooks["on_hour_passed"](time))
 
     async def __start(self):
+        uasyncio.create_task(self.__module_registrator())
         uasyncio.create_task(self.__uart_listener())
         uasyncio.create_task(self.__task_handler())
         uasyncio.create_task(self.__event_listener())
