@@ -1,11 +1,14 @@
 from ktane import Module
-from components import IO
 
-module = Module("module3", status_led=(11,12,13), uart=(0,1))
-led = IO(25)
+module = Module("module3", status_led=(12,13,15), uart=(0,1))
 
-@module.command(0x00)
-async def link(tx, v):
-    led.value(v[0])
+@module.event
+async def on_ready():
+    print("READY!")
+
+@module.task(freq=1000)
+async def modules():
+    print(module.g)
+    print(module.get_addresses())
 
 module.run()
