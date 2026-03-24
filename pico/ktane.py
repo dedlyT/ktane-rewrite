@@ -4,16 +4,9 @@ import uasyncio
 import random
 import time
 
-START_BYTE = 0xAA
-RX_GLOBAL_BYTE = 0xEE
 CMD, RX, TX, LEN = 2,3,4,5
 CHKSUM = lambda cmd,rx,tx,len,data: (cmd+rx+tx+len+sum(data)) & 0xFF
-
-REG_ATTEMPT, REG_FAIL = 0xBA, 0xBF
 REG_TIMEOUT = 1000
-REG_QUERY, REG_INFO = 0xBC, 0xBE
-
-HEARTBEAT = 0xBD
 HEARTBEAT_TIME = 2000
 HEARTBEAT_TIMEOUT = 3000
 
@@ -31,7 +24,7 @@ class defaultdict(dict):
 #enum Status for status_led colours
 class Status:
     RED = (1,0,0)
-    ORANGE = (1,0.5,0)
+    ORANGE = (1,0.25,0)
     YELLOW = (1,1,0)
     GREEN = (0,1,0)
     CYAN = (0,1,1)
@@ -47,12 +40,24 @@ class Status:
         if v not in Status.__dict__.values():
             raise ValueError(f"{v} not a valid enum")
         return v
+    
+class Bytes:
+    START = 0xAA
+    RX_GLOBAL = 0xEE
+    REG_ATTEMPT = 0xBA
+    REG_FAIL = 0xBF
+    REG_QUERY = 0xBC
+    REG_VARS_QUERY = 0xBE
+    REG_TYPE = 0xCA
+    REG_STR = 0xCB
+    REG_INT = 0xCC
+    HEARTBEAT = 0xBD
 
 async def __empty(*a, **kw): pass
 
 def generate_temp_id() -> int:
     temp_id = None
-    while temp_id in (None, START_BYTE, RX_GLOBAL_BYTE):
+    while temp_id in (None, Bytes.START, Bytes.RX_GLOBAL):
         temp_id = random.randint(1,255)
     return temp_id
 
@@ -74,7 +79,7 @@ class Module:
         self.__components = []
 
         self.__g = {}
-        self.__g["modules"] = defaultdict(dict)
+        self.g["modules"] = defaultdict(dict)
         self.__alive_modules = set()
 
         self.__next = defaultdict(time.ticks_ms)
@@ -103,7 +108,7 @@ class Module:
         self.__uart_data = default_uart_data()
 
         self.__time = {u:0 for u in "smh"}
-    
+        
     #DECORATOR register event hook
     def event(self, f:function) -> None:
         if f.__name__ in self.ALLOWED_EVENTS:
@@ -136,34 +141,45 @@ class Module:
         for led,v in zip(self.__status_led_objs, values):
             led.value(v, percentage=True)
     
+    def query_variables(self, address:int) -> None:
+        if not isinstance(address, int) or (address > 0xFF or address < 0x00):
+            raise TypeError("address must be hexadecimal int!")
+        module_exists = self.g["modules"].get(address)
+        if not module_exists:
+            return
+        next_query = self.g["modules"][address].get("next_query", 0)
+        if Module.time_has_elapsed(next_query):
+            self.g["modules"][address]["next_query"] = time.ticks_ms() + 1000
+            self.send(Bytes.REG_VARS_QUERY, rx=address)
+
     #send message over UART channels
     def send(self, cmd:int, data=None, **kwargs) -> None:
         packet = bytearray()
-        packet.append(START_BYTE) #[START]
+        packet.append(Bytes.START) #[START]
 
         if not isinstance(cmd, int):
             raise TypeError(f"cmd must be int, not {type(cmd)}")
         if cmd < 0x00 or cmd > 0xFF:
             raise ValueError("cmd must be single-byte hexadecimal!")
-        if cmd == START_BYTE:
-            raise ValueError(f"cmd must not be reserved hexadecimal byte {START_BYTE}")
+        if cmd == Bytes.START:
+            raise ValueError(f"cmd must not be reserved hexadecimal byte {Bytes.START}")
         packet.append(cmd) #[CMD]
         
         rx = kwargs.get("rx")
         if rx is None:
-            rx = RX_GLOBAL_BYTE
+            rx = Bytes.RX_GLOBAL
         if not isinstance(rx, int):
             raise TypeError(f"rx must be int, not {type(rx)}")
         if rx < 0x00 or rx > 0xFF:
             raise ValueError("rx must be single-byte hexadecimal!")
-        if rx == START_BYTE:
-            raise ValueError(f"rx must not be reserved hexadecimal byte {START_BYTE}")
+        if rx == Bytes.START:
+            raise ValueError(f"rx must not be reserved hexadecimal byte {Bytes.START}")
         packet.append(rx) #[RX]
         
         tx = kwargs.get("tx", self.__id)
         packet.append(tx) #[TX]
 
-        data = data or []
+        data = data if data is not None else []
         if not isinstance(data, (list, tuple, str, bytearray)):
             data = [data]
         
@@ -176,8 +192,8 @@ class Module:
 
             if item < 0x00 or item > 0xFF:
                 raise ValueError(f"ascii character '{item}' hexadecimal must be one byte")
-            if item == START_BYTE:
-                raise ValueError(f"ascii character '{item}' hexadecimal cannot be reserved byte {START_BYTE}")
+            if item == Bytes.START:
+                raise ValueError(f"ascii character '{item}' hexadecimal cannot be reserved byte {Bytes.START}")
 
             databytes.append(item)
 
@@ -190,50 +206,59 @@ class Module:
         #[START][CMD][RX][TX][LEN][DATA][CHK]
         self.__uart_obj.write(packet)
 
-    async def __process_command(self, cmd:int, rx:int, tx:int, data:bytearray):
+    def __process_command(self, cmd:int, rx:int, tx:int, data:bytearray):
         current_id = self.__id if self.__temp_id is None else self.__temp_id
 
         #did i send the command?
         if tx == current_id:
             #did my reg attempt succeed? (and im unregistered)
-            if cmd == REG_ATTEMPT and self.__id is None:
+            if cmd == Bytes.REG_ATTEMPT and self.__id is None:
                 self.__id, self.__temp_id = self.__temp_id, None
-                self.send(REG_QUERY)
+                self.send(Bytes.REG_QUERY)
                 self.__event_queue.append(self.__event_hooks["on_ready"])
             return
         
         #is the command intended for me? (global or my id)
-        if rx not in (RX_GLOBAL_BYTE, current_id):
+        if rx not in (Bytes.RX_GLOBAL, current_id):
             self.send(cmd, data, tx=tx, rx=rx)
             return
         
         #built-in commands:
         should_pass_message_on = None
-        if cmd == REG_FAIL:
+        if cmd == Bytes.REG_FAIL:
             self.__temp_id = generate_temp_id()
-            self.send(REG_ATTEMPT, tx=self.__temp_id)
+            self.send(Bytes.REG_ATTEMPT, tx=self.__temp_id)
             should_pass_message_on = False
-        if cmd == REG_ATTEMPT:
+        if cmd == Bytes.REG_ATTEMPT:
             should_pass_message_on = True
             if tx == current_id:
-                self.send(REG_FAIL, rx=tx, tx=current_id)
+                self.send(Bytes.REG_FAIL, rx=tx, tx=current_id)
                 should_pass_message_on = False
-        if cmd == REG_QUERY:
+        if cmd == Bytes.REG_QUERY:
             if self.__id is not None:
-                self.send(REG_INFO, self.name, rx=tx)
+                self.send(Bytes.REG_TYPE, self.name, rx=tx)
             should_pass_message_on = True
-        if cmd == REG_INFO:
+        if cmd == Bytes.REG_TYPE:
             data = Module.bytes_to_string(data)
-            self.g["modules"][tx] = {"name":data}
+            self.g["modules"][tx] = {"name":data, "str_data":{}, "int_data":{}}
             should_pass_message_on = True
-        if cmd == HEARTBEAT:
+        if cmd == Bytes.REG_STR and tx in self.g["modules"]:
+            str_id = data[0]
+            str_data = Module.bytes_to_string(data[1:])
+            self.g["modules"][tx]["str_data"][str_id] = str_data
+            should_pass_message_on = True
+        if cmd == Bytes.REG_INT and tx in self.g["modules"]:
+            int_id = data[0]
+            int_data = data[1]
+            self.g["modules"][tx]["int_data"][int_id] = int_data
+            should_pass_message_on = True
+        if cmd == Bytes.HEARTBEAT:
             self.__alive_modules.add(tx)
             should_pass_message_on = True
         
-        if should_pass_message_on and (rx == RX_GLOBAL_BYTE):
-            self.send(cmd, tx=tx)
-        if should_pass_message_on is not None:
-            return
+        #if the message is global AND either the message should be passed on or it isn't a built-in command.
+        if (rx == Bytes.RX_GLOBAL) and (should_pass_message_on or should_pass_message_on is None):
+            self.send(cmd, data, tx=tx)
 
         #call custom command hooks
         self.__event_queue.append(lambda cmd=cmd, tx=tx, data=data: self.__command_hooks.get(cmd, __empty)(tx, data))
@@ -249,7 +274,7 @@ class Module:
             #send registration message cyclically
             if Module.time_has_elapsed(self.__next["registration_message"]):
                 self.__next["registration_message"] += REG_TIMEOUT
-                self.send(REG_ATTEMPT, tx=self.__temp_id)
+                self.send(Bytes.REG_ATTEMPT, tx=self.__temp_id)
             
             #blink purple led to indicate that it's unregistered
             if self.status_led in (Status.LILAC, Status.OFF):
@@ -272,7 +297,7 @@ class Module:
             #heartbeat
             if Module.time_has_elapsed(self.__next["heartbeat"]):
                 self.__next["heartbeat"] += HEARTBEAT_TIME
-                self.send(HEARTBEAT)
+                self.send(Bytes.HEARTBEAT)
 
             if Module.time_has_elapsed(self.__next["prune"]):
                 self.__next["prune"] += HEARTBEAT_TIMEOUT
@@ -281,14 +306,14 @@ class Module:
                 for addresses in self.get_addresses().values():
                     for address in addresses:
                         if address not in self.__alive_modules:
-                            self.__g["modules"].pop(address, None)
+                            self.g["modules"].pop(address, None)
                             continue
                         self.__alive_modules.remove(address)
                 
                 #instantiate new modules
                 for address in self.__alive_modules.copy():
                         self.__alive_modules.discard(address)
-                        self.send(REG_QUERY, rx=address)
+                        self.send(Bytes.REG_QUERY, rx=address)
     
     async def __uart_listener(self):
         #clear buffer
@@ -301,7 +326,7 @@ class Module:
 
             #when reading first byte:
             if not self.__uart_data["POS"]:
-                if byte == START_BYTE:
+                if byte == Bytes.START:
                     self.__uart_data["POS"] += 1
                     continue
             self.__uart_data["POS"] += 1
@@ -331,7 +356,7 @@ class Module:
                     
                     #process the message and execute any built-in commands
                     uart_data = self.__uart_data.copy()
-                    await self.__process_command(uart_data["CMD"], uart_data["RX"], uart_data["TX"], uart_data["DATA"])
+                    self.__process_command(uart_data["CMD"], uart_data["RX"], uart_data["TX"], uart_data["DATA"])
                     self.__uart_data = default_uart_data()
                     continue
                 #collect data stream
@@ -427,6 +452,10 @@ class Module:
         return self.__name
     
     @property
+    def is_registered(self) -> bool:
+        return (self.__id is not None)
+    
+    @property
     def status_led(self) -> tuple[int]:
         return self.__status_led
     
@@ -438,7 +467,7 @@ class Module:
 
     @property
     def g(self) -> dict:
-        return self.__g.copy()
+        return self.__g
 
     def get_addresses(self) -> dict[str, set[int]]:
         addresses = defaultdict(list)
