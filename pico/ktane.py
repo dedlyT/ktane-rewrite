@@ -149,7 +149,7 @@ class Module:
             return
         next_query = self.g["modules"][address].get("next_query", 0)
         if Module.time_has_elapsed(next_query):
-            self.g["modules"][address]["next_query"] = time.ticks_ms() + 1000
+            self.g["modules"][address]["next_query"] = time.ticks_ms() + 500
             self.send(Bytes.REG_VARS_QUERY, rx=address)
 
     #send message over UART channels
