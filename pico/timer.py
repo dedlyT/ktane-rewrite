@@ -14,6 +14,7 @@ bzr = IO(16, "pwm", freq=500, duty_u16=1000)
 btn = IO(15, "in", pull="up")
 
 LABELS = ("SND", "CLR", "CAR", "IND", "FRQ", "SIG", "NSA", "MSA", "TRN", "BOB", "FRK")
+SERIAL_NUMBER_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXZ0123456789"
 MAX_STRIKES = len(strike_leds)
 C7, B6, G6, C6, G5, E5, D5, C5, B5, A5, A4, G4, E4, D4, B4, AS3, A3, GS3, G3, E3, C3, P = 2093, 1976, 1568, 1047, 784, 659, 587, 523, 988, 880, 440, 392, 330, 294, 494, 233, 220, 208, 196, 165, 131, -1
 FAIL_TUNE = [C7,C7,C7,C7,C7,B6,B6,B6,G6,G6,G6,C6,C6,G5,G5,E5,D5,C5,A4,G4,E4,D4,A3,A3,G3,G3,E3,E3,E3,C3,C3,C3]
@@ -33,7 +34,7 @@ module.g["timer"] = {"m":1,"s":0}
 module.g["strikes"] = 0
 module.g["defused_modules"] = set()
 module.g["has_boomed"] = False
-module.g["characteristics"] = {"batteries":0, "lit_labels":[], "unlit_labels":[]}
+module.g["characteristics"] = {"batteries":0, "lit_labels":[], "unlit_labels":[], "serial":None}
 
 @module.event
 async def on_ready():
@@ -58,8 +59,9 @@ def module_on():
     module.g["defused_modules"] = set()
 
     module.g["strikes"] = 0
-    module.g["timer"] = {"m":1,"s":0}
+    module.g["timer"] = {"m":5,"s":0}
     module.g["characteristics"]["batteries"] = random.randint(0,4)
+    module.g["characteristics"]["serial"] = "".join(random.choice(SERIAL_NUMBER_CHARS) for _ in range(6))
     labels = list(LABELS)
     selected_labels = [labels.pop(random.randint(0, len(labels)-1)) for _ in range(random.randint(3,5))]
     module.g["characteristics"]["lit_labels"] = [selected_labels.pop() for _ in range(random.randint(0,len(selected_labels)))]
@@ -68,6 +70,7 @@ def module_on():
 
     module.send(0x11, get_label_ids("lit"))
     module.send(0x13, module.g["characteristics"]["batteries"])
+    broadcast_serial()
     broadcast_time()
 
 @module.task()
@@ -217,5 +220,11 @@ def broadcast_time():
     if len(seconds) == 2:
         data.append(ord(seconds[1]))
     module.send(0x15, data)
+
+def broadcast_serial():
+    data = bytearray()
+    for char in module.g["characteristics"]["serial"]:
+        data.append(ord(char))
+    module.send(0x16, data)
 
 module.run()
